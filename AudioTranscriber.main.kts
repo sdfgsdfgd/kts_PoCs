@@ -38,8 +38,10 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
-import kotlinx.coroutines.flow.filterNot
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
@@ -63,12 +65,13 @@ import javax.sound.sampled.AudioSystem
 import javax.sound.sampled.DataLine
 import javax.sound.sampled.TargetDataLine
 import kotlin.system.exitProcess
-import kotlin.time.Duration.Companion.seconds
 
 // xx       === Resources ===
 //  https://platform.openai.com/docs/guides/realtime-transcription
 //  https://platform.openai.com/docs/guides/speech-to-text
+//  https://github.com/openai/whisper/discussions/608     ( a very solid Whisper implementation with self-healing (whisper overlays buffers to correct prev words?) )
 //  https://github.com/openai/whisper/discussions/264        ( OpenAI/whisper/discussions/264 - Transcription and diarization )
+//  https://github.com/openai/openai-python/blob/main/src/openai/resources/beta/realtime/realtime.py
 //
 //  Doesn't seem to be as accurate as time-stamp, buffer corrected normal Transcription. Overall, a successful PoC nevertheless.
 //  Real-time can be overlayed by the longer-buffered audio-transcription via a secondary call, to achieve ultimate accuracy (100%) of words at the expense of paying a bit more :P
@@ -92,11 +95,13 @@ private val _transcriptionStateFlow = MutableStateFlow("")
 val transcriptionStateFlow: StateFlow<String> = _transcriptionStateFlow
 
 GlobalScope.launch {
-    transcriptionStateFlow.debounce(2.seconds).filterNot { it.isBlank() }.collect { text ->
-        _transcriptionStateFlow.value = "${_transcriptionStateFlow.value} \n"
-
-        println("\n[Transcript] => $text\n")
-    }
+    transcriptionStateFlow
+        .filter { it.isNotBlank() }
+        .distinctUntilChanged()
+        .debounce(2000)
+        .collectLatest { text ->
+            println("\n[Transcript] => $text\n")
+        }
 }
 
 /**
@@ -120,8 +125,8 @@ suspend fun obtainEphemeralSession(
                 }
                 putJsonObject("turn_detection") {
                     put("type", "server_vad")
-                    put("threshold", 0.5)
-                    put("prefix_padding_ms", 300)
+                    put("threshold", 0.5) // 0.2
+                    put("prefix_padding_ms", 300) // 600 ?
                     put("silence_duration_ms", 200)
                 }
                 putJsonObject("input_audio_noise_reduction") {
@@ -133,15 +138,13 @@ suspend fun obtainEphemeralSession(
             }.toString()
         )
     }
+
     check(resp.status.isSuccess()) { "Failed ephemeral request => ${resp.status}" }
 
     val root = resp.body<String>().parseJson()
-    val sessionId = root["id"]?.jsonPrimitive?.content
-        ?: error("No ephemeral session id found")
-    val clientSecretObj = root["client_secret"]?.jsonObject
-        ?: error("No ephemeral token in response")
-    val ephemeralToken = clientSecretObj["value"]?.jsonPrimitive?.content
-        ?: error("No ephemeral token found")
+    val sessionId = root["id"]?.jsonPrimitive?.content ?: error("No ephemeral session id found")
+    val clientSecretObj = root["client_secret"]?.jsonObject ?: error("No ephemeral token in response")
+    val ephemeralToken = clientSecretObj["value"]?.jsonPrimitive?.content ?: error("No ephemeral token found")
 
     // Print optional expiry info
     clientSecretObj["expires_at"]?.jsonPrimitive?.longOrNull?.let { epochSec ->
@@ -161,7 +164,7 @@ suspend fun obtainEphemeralSession(
  */
 fun micFlow(
     format: AudioFormat = AudioFormat(16000f, 16, 1, true, false),
-    bufferSize: Int = 6400 // Corresponds to 400ms of audio, still potentially cuts too many words
+    bufferSize: Int = 6400 // Corresponds to 400ms of audio, still potentially can cut too many words ?
 ): Flow<ByteArray> = callbackFlow {
     val info = DataLine.Info(TargetDataLine::class.java, format)
     check(AudioSystem.isLineSupported(info)) { "No supported microphone found!" }
@@ -180,16 +183,13 @@ fun micFlow(
         line.stop()
         line.close()
     }
-    // We never manually close; the callbackFlow closes on cancel.
+    // callbackFlow closes on cancel
 }
 
 runBlocking {
-    val openAiApiKey = System.getenv("OPENAI_API_KEY")
-        ?: error("No OPENAI_API_KEY found in environment!")
-
+    val openAiApiKey = System.getenv("OPENAI_API_KEY") ?: error("No OPENAI_API_KEY found in environment!")
     println("Starting realtime transcription. Press ENTER at any time to stop.")
 
-    // Prepare an HttpClient
     val client = HttpClient(CIO) {
         install(WebSockets)
         install(Logging) {
@@ -198,18 +198,17 @@ runBlocking {
         }
     }
 
-    // Obtain ephemeral session & token
+    // POST: Realtime Req - Get ephemeral session & token
     val (ephemeralSessionId, ephemeralBearer) = obtainEphemeralSession(client, openAiApiKey)
     println("Ephemeral token obtained => $ephemeralBearer")
 
-    // Use prompt entry for Job toggle  ( pause/resume )
     val userInputJob = launch(Dispatchers.IO) {
         readlnOrNull()
         println("User pressed ENTER. Stopping ...")
         coroutineContext.cancelChildren()  // cancel all siblings
     }
 
-    // 3) Connect via WebSocket and handle transcription events
+    // WS - The Core
     val webSocketJob = launch {
         client.webSocket(request = {
             url("wss://api.openai.com/v1/realtime?intent=transcription")
