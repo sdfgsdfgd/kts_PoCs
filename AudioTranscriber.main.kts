@@ -5,33 +5,99 @@
 @file:DependsOn("io.ktor:ktor-client-logging-jvm:2.3.3")
 @file:DependsOn("io.ktor:ktor-client-websockets:2.3.3")
 @file:DependsOn("org.jetbrains.kotlinx:kotlinx-serialization-json:1.5.1")
+@file:OptIn(FlowPreview::class)
+@file:Suppress("OPT_IN_USAGE")
 
-import io.ktor.client.*
-import io.ktor.client.call.*
-import io.ktor.client.engine.cio.*
-import io.ktor.client.plugins.logging.*
-import io.ktor.client.plugins.websocket.*
-import io.ktor.client.request.*
-import io.ktor.http.*
-import io.ktor.websocket.*
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
-import kotlinx.serialization.json.*
+import io.ktor.client.HttpClient
+import io.ktor.client.call.body
+import io.ktor.client.engine.cio.CIO
+import io.ktor.client.plugins.logging.DEFAULT
+import io.ktor.client.plugins.logging.LogLevel
+import io.ktor.client.plugins.logging.Logger
+import io.ktor.client.plugins.logging.Logging
+import io.ktor.client.plugins.websocket.WebSockets
+import io.ktor.client.plugins.websocket.webSocket
+import io.ktor.client.request.header
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
+import io.ktor.client.request.url
+import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
+import io.ktor.http.contentType
+import io.ktor.http.isSuccess
+import io.ktor.websocket.Frame
+import io.ktor.websocket.readText
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.filterNot
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import java.text.SimpleDateFormat
-import java.util.*
-import javax.sound.sampled.*
+import java.util.Base64
+import java.util.Date
+import javax.sound.sampled.AudioFormat
+import javax.sound.sampled.AudioSystem
+import javax.sound.sampled.DataLine
+import javax.sound.sampled.TargetDataLine
 import kotlin.system.exitProcess
+import kotlin.time.Duration.Companion.seconds
+
+// xx       === Resources ===
+//  https://platform.openai.com/docs/guides/realtime-transcription
+//  https://platform.openai.com/docs/guides/speech-to-text
+//  https://github.com/openai/whisper/discussions/264        ( OpenAI/whisper/discussions/264 - Transcription and diarization )
+//
+//  Doesn't seem to be as accurate as time-stamp, buffer corrected normal Transcription. Overall, a successful PoC nevertheless.
+//  Real-time can be overlayed by the longer-buffered audio-transcription via a secondary call, to achieve ultimate accuracy (100%) of words at the expense of paying a bit more :P
+//
+// It can also be overlayed by  `Speaker Diarization` via Elevenlabs API, to distinguish between speakers.
+
+//
+//
+//
+// =====================================================|
+//                                                      |
+//  Real-time Transcription API  &  Speech-to-Text API  |
+//             ( OpenAI )                               |
+// =====================================================|
+//
+//
+//
 
 // StateFlow to hold the entire evolving transcript
 private val _transcriptionStateFlow = MutableStateFlow("")
 val transcriptionStateFlow: StateFlow<String> = _transcriptionStateFlow
 
 GlobalScope.launch {
-    transcriptionStateFlow.collectLatest { text ->
+    transcriptionStateFlow.debounce(2.seconds).filterNot { it.isBlank() }.collect { text ->
+        _transcriptionStateFlow.value = "${_transcriptionStateFlow.value} \n"
+
         println("\n[Transcript] => $text\n")
     }
 }
-
 
 /**
  * 1) Fetch ephemeral session from OpenAI, returning (sessionId, ephemeralBearer).
@@ -49,20 +115,20 @@ suspend fun obtainEphemeralSession(
                 put("input_audio_format", "pcm16")
                 putJsonObject("input_audio_transcription") {
                     put("model", "gpt-4o-transcribe")
-                    put("prompt", "")
+                    put("prompt", "expect words relating to kotlin, android development or software keywords")
                     put("language", "en")
                 }
                 putJsonObject("turn_detection") {
                     put("type", "server_vad")
                     put("threshold", 0.5)
                     put("prefix_padding_ms", 300)
-                    put("silence_duration_ms", 500)
+                    put("silence_duration_ms", 200)
                 }
                 putJsonObject("input_audio_noise_reduction") {
-                    put("type", "near_field")
+                    put("type", "near_field") // values:  null, near_field, far_field | Default: near_field  if null not passed
                 }
                 put("include", buildJsonArray {
-                    add("item.input_audio_transcription.logprobs")
+                    add("item.input_audio_transcription.logprobs") // <-- Use to calculate confidence scores  ( will be very helpful with accuracy improvements & diarization)
                 })
             }.toString()
         )
@@ -90,12 +156,12 @@ suspend fun obtainEphemeralSession(
 }
 
 /**
- * 2) Create a cold Flow<ByteArray> that captures from the mic. We hold
- *    the line open until the collector cancels (structured concurrency).
+ * 2)   Cold Flow<ByteArray> that captures from the mic.
+ *      We hold the line open until the collector cancels (structured concurrency)
  */
-fun microphoneFlow(
+fun micFlow(
     format: AudioFormat = AudioFormat(16000f, 16, 1, true, false),
-    bufferSize: Int = 2048
+    bufferSize: Int = 6400 // Corresponds to 400ms of audio, still potentially cuts too many words
 ): Flow<ByteArray> = callbackFlow {
     val info = DataLine.Info(TargetDataLine::class.java, format)
     check(AudioSystem.isLineSupported(info)) { "No supported microphone found!" }
@@ -136,7 +202,7 @@ runBlocking {
     val (ephemeralSessionId, ephemeralBearer) = obtainEphemeralSession(client, openAiApiKey)
     println("Ephemeral token obtained => $ephemeralBearer")
 
-    // A job that waits for user input (ENTER) to stop
+    // Use prompt entry for Job toggle  ( pause/resume )
     val userInputJob = launch(Dispatchers.IO) {
         readlnOrNull()
         println("User pressed ENTER. Stopping ...")
@@ -145,28 +211,19 @@ runBlocking {
 
     // 3) Connect via WebSocket and handle transcription events
     val webSocketJob = launch {
-        client.webSocket(
-            request = {
-                url("wss://api.openai.com/v1/realtime?intent=transcription")
-                header(HttpHeaders.Authorization, ephemeralBearer)
-                header("OpenAI-Beta", "realtime=v1")
-            }
-        ) {
+        client.webSocket(request = {
+            url("wss://api.openai.com/v1/realtime?intent=transcription")
+            header(HttpHeaders.Authorization, ephemeralBearer)
+            header("OpenAI-Beta", "realtime=v1")
+        }) {
             println("WS CONNECTED, ephemeralSessionId=$ephemeralSessionId")
-
-            // We'll start a mic streaming job only once we see 'transcription_session.created'
             var micJob: Job? = null
-
             try {
                 for (frame in incoming) {
                     frame as? Frame.Text ?: continue
-                    val text = frame.readText()
-                    val root = text.parseJson()
-                    val eventType = root["type"]?.jsonPrimitive?.contentOrNull
-
-                    when (eventType) {
+                    val root = frame.readText().parseJson()
+                    when (root["type"]?.jsonPrimitive?.contentOrNull) {
                         "transcription_session.created" -> {
-                            // Indicate we're ready to receive updates
                             send(
                                 Frame.Text(
                                     buildJsonObject {
@@ -175,31 +232,32 @@ runBlocking {
                                     }.toString()
                                 )
                             )
-                            println("✅ Session confirmed. Starting mic stream...")
+                            println("✅ Session created. Starting mic stream...")
 
                             // 4) Start streaming mic data
                             micJob = launch {
-                                microphoneFlow().collect { audioChunk ->
+                                micFlow().collect { audioChunk ->
                                     val b64 = Base64.getEncoder().encodeToString(audioChunk)
-                                    val frameObj = buildJsonObject {
-                                        put("type", "input_audio_buffer.append")
-                                        put("event_id", "event_${System.currentTimeMillis()}")
-                                        put("audio", b64)
-                                    }
-                                    send(Frame.Text(frameObj.toString()))
+                                    send(
+                                        Frame.Text(
+                                            buildJsonObject {
+                                                put("type", "input_audio_buffer.append")
+                                                put("event_id", "event_${System.currentTimeMillis()}")
+                                                put("audio", b64)
+                                            }.toString()
+                                        )
+                                    )
                                 }
                             }
                         }
 
-                        // Partial transcripts
-                        "conversation.item.input_audio_transcription.delta" -> {
+                        "conversation.item.input_audio_transcription.delta" -> { // Partial transcripts
                             val snippet = root["delta"]?.jsonPrimitive?.contentOrNull
                                 ?: root["transcript"]?.jsonPrimitive?.contentOrNull
                                 ?: ""
                             _transcriptionStateFlow.value += " $snippet"
                         }
 
-                        // "Final" chunk for a turn (or chunk)
                         "conversation.item.created" -> {
                             val item = root["item"]?.jsonObject ?: continue
                             val contentArray = item["content"]?.jsonArray ?: continue
@@ -213,10 +271,15 @@ runBlocking {
                             }
                         }
 
-                        else -> {
-                            // For debugging: show any other event that arrives
-//                            println("Other event => $eventType, full=$root")
+                        "conversation.item.input_audio_transcription.completed",
+                        "transcription_session.updated",
+                        "input_audio_buffer.speech_started",
+                        "input_audio_buffer.speech_stopped",
+                        "input_audio_buffer.committed" -> {
+                            println("✅ [ ${root["type"]} ] -> Msg contents were --> $root")
                         }
+
+                        else -> println("unknown message type: ${root["type"]?.jsonPrimitive?.contentOrNull}")
                     }
                 }
             } catch (ce: CancellationException) {
@@ -236,8 +299,5 @@ runBlocking {
     client.close()
     exitProcess(0)
 }
-/**
- * Main driver in a runBlocking script, with maximum coroutines idiom.
- */
 
 fun String.parseJson() = Json.parseToJsonElement(this).jsonObject
