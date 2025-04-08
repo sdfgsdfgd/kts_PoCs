@@ -205,7 +205,7 @@ runBlocking {
     val userInputJob = launch(Dispatchers.IO) {
         readlnOrNull()
         println("User pressed ENTER. Stopping ...")
-        coroutineContext.cancelChildren()  // cancel all siblings
+        coroutineContext.cancelChildren()
     }
 
     // WS - The Core
